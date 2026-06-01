@@ -1,0 +1,78 @@
+"""Benchmark harness for Part 1.3.
+
+Use this as a starting point. To get full credit on the benchmark you should
+sweep at least one of {batch_size, hidden_dim, num_experts, topk} and produce a
+table or plot in `analysis.md`.
+
+Run with (from the `pa3/` directory, same convention as `test_moe.py`):
+    mpirun --oversubscribe -n 4 python part1/benchmark.py
+"""
+import time
+
+import numpy as np
+
+from mpi_wrapper import mpi
+from rng import get_rng
+from moe import SimpleMoE, MoE_EP, MoE_TP
+
+
+def run_moe(moe_type, batch_size=8, feature_dim=32, hidden_dim=128,
+            output_dim=64, num_experts=None, topk=2, n_iters=10):
+    if num_experts is None:
+        num_experts = mpi.Get_size()
+
+    if mpi.Get_rank() == 0:
+        X = get_rng().randn(batch_size, feature_dim)
+    else:
+        X = None
+    X = mpi.bcast(X, root=0)
+
+    model_cls = {"simple": SimpleMoE, "ep": MoE_EP, "tp": MoE_TP}[moe_type]
+    moe = model_cls(
+        input_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        output_dim=output_dim,
+        num_experts=num_experts,
+        topk=topk,
+    )
+
+    _ = moe(X)  # warm up
+    mpi.Barrier()
+
+    t0 = time.time()
+    for _ in range(n_iters):
+        outputs = moe(X)
+    mpi.Barrier()
+    avg_ms = 1000 * (time.time() - t0) / n_iters
+
+    return outputs, avg_ms
+
+
+def benchmark_moe():
+    # Sweep hidden_dim and batch_size as required by Part 1.3.
+    world_size = mpi.Get_size()
+    hidden_dims = [4 * world_size, 8 * world_size, 16 * world_size, 32 * world_size]
+    batch_sizes = [8, 32]
+    feat = 2 * world_size   # small fixed feature/output dim
+    topk = min(2, world_size)
+
+    if mpi.Get_rank() == 0:
+        print(f"world_size = {world_size}")
+        header = f"{'config':48}  {'simple_ms':>12}  {'tp_ms':>10}  {'ep_ms':>10}"
+        print(header)
+        print("-" * len(header))
+
+    for batch in batch_sizes:
+        for hidden in hidden_dims:
+            kwargs = dict(batch_size=batch, feature_dim=feat, hidden_dim=hidden,
+                          output_dim=feat, topk=topk)
+            _, t_simple = run_moe("simple", **kwargs)
+            _, t_tp     = run_moe("tp",     **kwargs)
+            _, t_ep     = run_moe("ep",     **kwargs)
+            if mpi.Get_rank() == 0:
+                tag = f"b={batch} feat={feat} hidden={hidden} k={topk}"
+                print(f"{tag:48}  {t_simple:12.2f}  {t_tp:10.2f}  {t_ep:10.2f}")
+
+
+if __name__ == "__main__":
+    benchmark_moe()
