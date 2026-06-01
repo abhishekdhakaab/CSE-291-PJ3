@@ -88,42 +88,33 @@ class Communicator(object):
         )
 
     def myAlltoall(self, src_array, dest_array):
-        """Manual alltoall: Irecv from all peers, copy own segment, Send to all peers."""
         nprocs = self.comm.Get_size()
         rank = self.comm.Get_rank()
         assert src_array.size % nprocs == 0
         assert dest_array.size == src_array.size
-
         seg = src_array.size // nprocs
         seg_bytes = src_array.itemsize * seg
         src_flat = src_array.ravel()
         dst_flat = dest_array.ravel()
-
-        # Post receives from all other ranks first.
+        # receives from all the other rank first
         recv_bufs = [None] * nprocs
         recv_reqs = [None] * nprocs
         for peer in range(nprocs):
             if peer != rank:
                 recv_bufs[peer] = np.empty(seg, dtype=src_array.dtype)
                 recv_reqs[peer] = self.comm.Irecv(recv_bufs[peer], source=peer, tag=peer)
-
-        # Copy own segment directly.
+        # copy own segment directly
         dst_flat[rank * seg:(rank + 1) * seg] = src_flat[rank * seg:(rank + 1) * seg]
-
-        # Send to all other ranks.
+        # send to every other rank
         for peer in range(nprocs):
             if peer != rank:
                 self.comm.Send(np.ascontiguousarray(src_flat[peer * seg:(peer + 1) * seg]),
                                dest=peer, tag=rank)
                 self.total_bytes_transferred += seg_bytes
-
-        # Wait for all receives and copy into dest.
+        # await for all receive and copy in destination
         for peer in range(nprocs):
             if peer != rank:
                 recv_reqs[peer].Wait()
                 dst_flat[peer * seg:(peer + 1) * seg] = recv_bufs[peer]
                 self.total_bytes_transferred += seg_bytes
-
-
-# Default global communicator (mirrors the pa2 convention).
 mpi = Communicator(MPI.COMM_WORLD)

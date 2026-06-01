@@ -1,3 +1,4 @@
+
 """Benchmark harness for Part 1.3.
 
 Use this as a starting point. To get full credit on the benchmark you should
@@ -49,29 +50,26 @@ def run_moe(moe_type, batch_size=8, feature_dim=32, hidden_dim=128,
 
 
 def benchmark_moe():
-    # Sweep hidden_dim and batch_size as required by Part 1.3.
-    world_size = mpi.Get_size()
-    hidden_dims = [4 * world_size, 8 * world_size, 16 * world_size, 32 * world_size]
-    batch_sizes = [8, 32]
-    feat = 2 * world_size   # small fixed feature/output dim
-    topk = min(2, world_size)
-
+    configs = [
+        # (batch, feature, hidden, output, topk)
+        (32, 64, 256, 64, 2),
+        (64, 64, 256, 64, 2),
+        (32, 128, 512, 128, 2),
+    ]
     if mpi.Get_rank() == 0:
-        print(f"world_size = {world_size}")
-        header = f"{'config':48}  {'simple_ms':>12}  {'tp_ms':>10}  {'ep_ms':>10}"
-        print(header)
-        print("-" * len(header))
+        print(f"world_size = {mpi.Get_size()}")
+        print(f"{'config':40}  {'simple':>10}  {'tp':>10}  {'ep':>10}")
 
-    for batch in batch_sizes:
-        for hidden in hidden_dims:
-            kwargs = dict(batch_size=batch, feature_dim=feat, hidden_dim=hidden,
-                          output_dim=feat, topk=topk)
-            _, t_simple = run_moe("simple", **kwargs)
-            _, t_tp     = run_moe("tp",     **kwargs)
-            _, t_ep     = run_moe("ep",     **kwargs)
-            if mpi.Get_rank() == 0:
-                tag = f"b={batch} feat={feat} hidden={hidden} k={topk}"
-                print(f"{tag:48}  {t_simple:12.2f}  {t_tp:10.2f}  {t_ep:10.2f}")
+    for cfg in configs:
+        batch, feat, hidden, out, topk = cfg
+        kwargs = dict(batch_size=batch, feature_dim=feat, hidden_dim=hidden,
+                      output_dim=out, topk=topk)
+        _, t_simple = run_moe("simple", **kwargs)
+        _, t_tp = run_moe("tp", **kwargs)
+        _, t_ep = run_moe("ep", **kwargs)
+        if mpi.Get_rank() == 0:
+            tag = f"b={batch} d={feat} h={hidden} k={topk}"
+            print(f"{tag:40}  {t_simple:10.2f}  {t_tp:10.2f}  {t_ep:10.2f}")
 
 
 if __name__ == "__main__":
