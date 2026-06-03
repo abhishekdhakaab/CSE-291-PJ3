@@ -1,6 +1,7 @@
 # PA3 — Speculative Decoding Report
 
 Used NVIDIA CUDA 4090
+
 ---
 
 ## 3.2 Performance Results (`k=8`, `max_tokens=100`, 3 runs)
