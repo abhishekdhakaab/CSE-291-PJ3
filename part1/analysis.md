@@ -1,20 +1,12 @@
 # Part 1.3 — Benchmark Analysis
 
-## 1. Setup
+## Setup
 
-- **Hardware:** Apple M-series / x86-64 CPU (4 logical cores used via --oversubscribe)
-- **MPI:** Open MPI (mpirun --oversubscribe -n 4)
-- **World size:** 4 ranks
-- **dtype:** float32 (NumPy)
-- **Iterations per timing:** 10 warm-start repetitions
+I ran the benchmark on my MacBook (Apple M-series, 4 cores) using `mpirun --oversubscribe -n 4`. Everything is NumPy float32. Each timing is the average of 10 iterations after one warm-up run so the numbers are reasonably stable.
 
-## 2. Sweeps
+## Results
 
-We swept `hidden_dim` ∈ {16, 32, 64, 128} and `batch_size` ∈ {8, 32},
-with fixed `feature_dim = output_dim = 8`, `topk = 2`, `num_experts = 4`, `world_size = 4`.
-
-All timings are milliseconds per forward pass (average of 10 iterations),
-measured with `mpirun --oversubscribe -n 4 python part1/benchmark.py` on a 4-core CPU (Apple M-series).
+I swept `hidden_dim` across {16, 32, 64, 128} and `batch_size` across {8, 32}, keeping `feature_dim = output_dim = 8`, `topk = 2`, `num_experts = 4`.
 
 | batch | hidden | SimpleMoE (ms) | MoE_TP (ms) | MoE_EP (ms) |
 |------:|-------:|---------------:|------------:|------------:|
@@ -27,63 +19,30 @@ measured with `mpirun --oversubscribe -n 4 python part1/benchmark.py` on a 4-cor
 |    32 |     64 |           0.35 |        3.73 |        0.32 |
 |    32 |    128 |           0.43 |        3.71 |        0.35 |
 
-## 3. Discussion
+## What I observed
 
-### Tensor Parallel (MoE_TP)
+### Tensor Parallel is surprisingly slow here
 
-MoE_TP shards each expert's weight matrices across ranks (column-parallel).  Each rank
-computes a `(batch, hidden/world_size)` partial output, then **Allgather** reassembles
-the full `(batch, output_dim)` result on every rank.
+MoE_TP came out 6–10x slower than SimpleMoE across every config, which was more than I expected. The reason makes sense once you think about it: ShardedLinear calls Allgather twice per expert forward pass (once after fc1, once after fc2), and on a CPU with tiny tensors, each of those collectives costs around 0.4 ms just in latency. The actual matrix multiply at these sizes is basically free, so the communication just dominates completely.
 
-- **Communication pattern:** `Allgather` — each rank sends `batch × local_out_features × 4 bytes`
-  and receives the full output from all other ranks.
-- **Observed:** MoE_TP is 6–10× slower than SimpleMoE across all configs. With
-  `output_dim = 8` (tiny output), every ShardedLinear call triggers two Allgather collectives
-  whose per-call latency (~0.4 ms each) completely dominates the negligible matmul cost.
-  MoE_TP is **communication-latency-bound** at these small dimensions.
-- **Scaling behavior:** Allgather volume is O(batch × output_dim), independent of hidden_dim,
-  so timing barely changes as hidden grows (0.87 ms → 0.95 ms for batch=8). At much larger
-  hidden dims, the matmul would eventually dominate and amortize the collective overhead.
+What's interesting is that hidden_dim barely matters for TP timing at all — going from hidden=16 to hidden=128 only adds about 0.08 ms at batch=8. That's because Allgather volume depends on `batch × output_dim`, not on hidden_dim. The bottleneck is the fixed per-call overhead of the collective, not the data volume. If I had much larger hidden dims, the matmul would eventually start to cost something and the communication overhead would get amortized — but at these sizes we're nowhere near that crossover.
 
-### Expert Parallel (MoE_EP)
+Batch size hurts TP a lot. Going from batch=8 to batch=32, TP jumps from ~0.87 ms to ~3.36 ms (roughly 4x slower). This is because my TP forward loop runs ShardedExpert token-by-token, so it's doing O(batch × topk) Allgather calls. That's just a lot of small collectives piling up.
 
-MoE_EP routes entire tokens to their owning ranks via two **Alltoall** rounds.
+### Expert Parallel is much more reasonable
 
-- **Communication pattern:** Two `alltoall` calls per top-k slot.
-  Volume per round = `batch × input_dim` (tokens out) + `batch × output_dim` (results back).
-  This is **independent of `hidden_dim`**.
-- **Observed:** MoE_EP is 2–13× faster than MoE_TP and only 1.3–1.8× slower than SimpleMoE.
-  The Alltoall sends only 2 × (batch × 8) floats — very small — so per-token dispatch is
-  cheap. The expert compute is local after dispatch, avoiding the repeated Allgather overhead.
-- **Batch scaling:** EP timing grows more with batch (0.18 ms → 0.28–0.35 ms from batch 8 to 32)
-  than TP does (0.87 ms → 3.36 ms), because TP's token-by-token loop through ShardedExpert
-  triggers O(batch × topk) allgathers. EP amortizes all tokens into one Alltoall pair per
-  topk slot, keeping communication cost proportional to batch rather than batch².
+EP stayed within 1.3–1.8x of SimpleMoE, which is a very different story. The Alltoall sends only `batch × feature_dim` floats out and `batch × output_dim` floats back — at these tiny dimensions that's a small amount of data, so the dispatch is cheap. The expert compute itself runs locally after the first Alltoall, so there's no per-expert communication overhead.
 
-#### Custom `myAlltoall` path
+EP also scales with batch much more gracefully than TP. From batch=8 to batch=32, EP only goes from ~0.18 ms to ~0.28 ms. That makes sense — EP does one Alltoall pair per topk slot regardless of how many tokens there are, whereas TP is doing repeated collectives for every single token.
 
-My EP implementation uses the manual PA2 `myAlltoall` for both token dispatch
-and result return. Since that buffered collective sends equal-size segments, EP
-first exchanges each destination bucket's row count with `myAlltoall`, pads the
-token or result buckets to the largest bucket size for the round, and trims each
-received segment back to its exchanged row count. The padding keeps the manual
-collective's fixed-segment contract while preserving the variable token routing
-that expert parallelism needs.
+The one place EP doesn't shine is when hidden_dim is very large — because then the Alltoall for sending tokens becomes relatively cheaper compared to the expert compute, but my ShardedLinear in TP would also benefit more from the large matmul. At small dimensions EP wins pretty clearly; at large dimensions on fast interconnects (like NVLink on H100s), TP would likely close the gap.
 
-### Regime Summary
+### myAlltoall
 
-| Workload | SimpleMoE (ms) | MoE_TP (ms) | MoE_EP (ms) | Bottleneck |
-|----------|:--------------:|:-----------:|:-----------:|------------|
-| b=8, hidden=16–128 | 0.10–0.13 | 0.86–0.95 | 0.18–0.20 | TP: Allgather latency per ShardedLinear call |
-| b=32, hidden=16–128 | 0.33–0.43 | 3.32–3.73 | 0.28–0.35 | TP: O(batch×topk) Allgather calls; EP: local expert + cheap Alltoall |
+My EP uses the manual `myAlltoall` from PA2 for both the token dispatch and the result return. Since myAlltoall needs equal-size segments, I first exchange per-rank row counts (also via myAlltoall), pad all the token buckets to the maximum bucket size, run the collective, then trim using the received counts. It's a bit annoying to set up but it works correctly and lets me reuse the PA2 implementation directly.
 
-**Key takeaway:**
-- TP is preferred when experts have large weight matrices and high arithmetic intensity
-  (e.g., large hidden_dim), because the column-parallel matmul keeps all ranks busy.
-- EP is preferred when `num_experts ≫ world_size` or batch sizes are large, because
-  each rank stores only one expert (no weight replication) and the Alltoall cost
-  does not scale with the expert's hidden dimension.
-- In practice on GPU clusters with NVLink, TP Allgather is extremely fast (NVLink
-  bandwidth ~900 GB/s on H100), making TP competitive even at smaller hidden dims.
-  EP's two-Alltoall pattern requires the same high-bandwidth interconnect to be efficient
-  at scale (e.g., DeepSeek-V3 uses 256 experts across 32 nodes with InfiniBand).
+### Which one to use and when
+
+For these small workloads EP is clearly better — cheaper communication, simpler scaling with batch size. TP only makes sense when the expert weights are large enough that the column-parallel matmul actually keeps all ranks busy and amortizes the Allgather cost. On a real GPU cluster with NVLink (900 GB/s on H100), TP Allgather is extremely fast and the crossover happens much earlier. But on CPU with these tiny dimensions, EP wins every time.
+
+For something like DeepSeek-V3 with 256 experts across 32 nodes, EP is really the only option that scales — you can't replicate 256 experts on every rank. The Alltoall cost becomes the bottleneck there too, which is why they need InfiniBand to make it work.
