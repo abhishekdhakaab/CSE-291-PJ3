@@ -1,8 +1,6 @@
 # PA3 — Speculative Decoding Report
 
-**Models:** `EleutherAI/pythia-1.4b-deduped` (target), `EleutherAI/pythia-160m-deduped` (draft)  
-**Hardware:** GPU (CUDA), float16
-
+Used NVIDIA CUDA 4090
 ---
 
 ## 3.2 Performance Results (`k=8`, `max_tokens=100`, 3 runs)
@@ -27,6 +25,7 @@ Prompt: "The future of artificial intelligence is", baseline: 3.06s / 32.7 tok/s
 |  4 | 2.06 | 49.1 | 1.48× | 95.24% |
 |  8 | 1.98 | 50.5 | 1.55× | 91.67% |
 | 16 | 2.15 | 47.1 | 1.42× | 85.45% |
+
 All k values beat the baseline and have >=1.0x speedup. k=8 gives the best speedup at 1.55×. Acceptance rate decreases as k grows. This is because the draft's predictions become less reliable further out, so longer speculations are more likely to contain a mismatch.
 
 ---
@@ -47,14 +46,15 @@ At each step, `_ngram_lookup` scans the running context for the last `ngram_size
 If a match is found, the following tokens are used as draft (no model call). Otherwise it
 falls back to the standard draft model. Verification is the same `verify_tokens_vectorized`.
 
-### Results (ngram_size=4, k=8, 3 runs each, warm GPU)
+
+### Results (ngram_size=4, k=8, 3 runs each)
 
 | Prompt | N-gram tok/s | Baseline tok/s | Speedup | Acceptance Rate | N-gram Hit Rate |
 |--------|:------------:|:--------------:|:-------:|:---------------:|:---------------:|
-| "Write the lyrics to the song 'Happy Birthday'." | **241.18** | 52.19 | **4.58x** | 93.68% | 83.33% |
-| "The future of artificial intelligence is" | **237.73** | 49.00 | **4.95x** | 91.67% | 83.33% |
-| "Write a short story about a robot learning to feel emotions:" | **204.05** | 50.54 | **4.02x** | 100.00% | 75.00% |
-| **Average** | **227.65** | **50.58** | **4.52x** | **~95%** | **~80%** |
+| "Write the lyrics to the song 'Happy Birthday'." | 141.94 | 22.70 | 6.16× | 93.68% | 83.33% |
+| "The future of artificial intelligence is" | 126.14 | 22.74 | 5.60× | 91.67% | 83.33% |
+| "Write a short story about a robot learning to feel emotions:" | 98.73 | 27.44 | 3.39× | 100.00% | 75.00% |
+| Average | 122.27 | 24.29 | 5.05× | ~95% | ~80% |
 
 ### Why the speedup is so large
 
