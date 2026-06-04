@@ -1,6 +1,5 @@
 {
   "_name_or_path": "my-custom-98b-model",
-  "_comment": "Optimal model under $5M B200 budget. N ~ 9.78e10 (~98B params) from Chinchilla-style scaling law L(N,D) = 406.4/N^0.34 + 410.7/D^0.29 + 1.69. Architecture uses h=8192, 112 layers, GQA with 64 Q heads / 8 KV heads, SwiGLU MLP with intermediate=28672. Total params ~97.9B.",
   "architectures": ["LlamaForCausalLM"],
   "model_type": "llama",
   "hidden_size": 8192,

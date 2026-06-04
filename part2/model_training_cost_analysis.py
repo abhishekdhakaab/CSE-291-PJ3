@@ -5,185 +5,231 @@ import math
 
 
 def model_training_cost_analysis_llama(model_config_path):
-    """Returns (total_params, flops_layer_TF, peak_memory_GB) for a Llama-3 model.
+    """Analyze training cost of a dense Llama-style model.
 
-    Convention: batch=1, seq_len from config, bf16, rematerialization on.
+    Returns:
+        total_params:   total trainable parameter count (int)
+        flops_layer_TF: forward FLOPs of a single transformer layer (TFLOPs)
+        peak_memory_GB: peak forward memory of a single transformer layer (GB)
+
+    See the Part 2.1 writeup for the sequence-length / batch convention.
     """
     with open(model_config_path) as f:
         cfg = json.load(f)
 
-    h    = cfg["hidden_size"]
-    i    = cfg["intermediate_size"]
-    L    = cfg["num_hidden_layers"]
-    n_q  = cfg["num_attention_heads"]
-    n_kv = cfg["num_key_value_heads"]
-    V    = cfg["vocab_size"]
-    S    = cfg["max_position_embeddings"]
-    d    = h // n_q  # head dim
-    tie  = cfg.get("tie_word_embeddings", False)
+    hidden_size = cfg["hidden_size"]
+    intermediate_size = cfg["intermediate_size"]
+    num_layers = cfg["num_hidden_layers"]
+    num_heads = cfg["num_attention_heads"]
+    num_kv_heads = cfg["num_key_value_heads"]
+    vocab_size = cfg["vocab_size"]
+    seq_len = cfg["max_position_embeddings"]
+    head_dim = hidden_size // num_heads
+    tie_embeddings = cfg.get("tie_word_embeddings", False)
 
-    # ── Parameter count ──────────────────────────────────────────────────────
-    embed   = V * h
-    lm_head = 0 if tie else V * h
-    norm    = h  # final RMSNorm
+    embedding_params = vocab_size * hidden_size
+    lm_head_params = 0 if tie_embeddings else vocab_size * hidden_size
+    final_norm_params = hidden_size
 
-    # Per-layer: QKV projections, output projection, SwiGLU MLP, 2x RMSNorm
-    layer = (h * n_q * d        # Q
-           + h * n_kv * d       # K
-           + h * n_kv * d       # V
-           + n_q * d * h        # O
-           + h * i + h * i + i * h  # gate, up, down
-           + h + h)             # input_norm, post_attn_norm
+    attention_params = (
+        hidden_size * num_heads * head_dim
+        + hidden_size * num_kv_heads * head_dim
+        + hidden_size * num_kv_heads * head_dim
+        + num_heads * head_dim * hidden_size
+    )
 
-    total_params = embed + lm_head + norm + L * layer
+    mlp_params = 3 * hidden_size * intermediate_size
+    norm_params = 2 * hidden_size
+    layer_params = attention_params + mlp_params + norm_params
 
-    # ── Forward FLOPs for one layer (batch=1, seq=S) ─────────────────────────
-    # Attention projections
-    f  = 2 * S * h * (n_q * d)   # Q
-    f += 2 * S * h * (n_kv * d)  # K
-    f += 2 * S * h * (n_kv * d)  # V
-    f += 2 * S * (n_q * d) * h   # O
-    # Attention score and context
-    f += 2 * n_q * S * S * d     # QK^T
-    f += 2 * n_q * S * S * d     # Attn @ V
-    # SwiGLU MLP
-    f += 2 * S * h * i           # gate
-    f += 2 * S * h * i           # up
-    f += 2 * S * i * h           # down
-    flops_layer_TF = f / 1e12
+    total_params = embedding_params + lm_head_params + final_norm_params + num_layers * layer_params
 
-    # ── Peak memory for one layer (bf16, rematerialization) ──────────────────
-    BPE = 2  # bytes per bf16 element
-    peak = (layer * BPE             # layer weights
-          + S * h * BPE             # input activation
-          + S * n_q * d * BPE       # Q
-          + 2 * S * n_kv * d * BPE  # K + V
-          + n_q * S * S * BPE)      # attention score matrix (peak)
-    peak_memory_GB = peak / (1024 ** 3)
+    flops = 0
+    flops += 2 * seq_len * hidden_size * (num_heads * head_dim)
+    flops += 2 * seq_len * hidden_size * (num_kv_heads * head_dim)
+    flops += 2 * seq_len * hidden_size * (num_kv_heads * head_dim)
+    flops += 2 * seq_len * (num_heads * head_dim) * hidden_size
+    flops += 2 * num_heads * seq_len * seq_len * head_dim
+    flops += 2 * num_heads * seq_len * seq_len * head_dim
+    flops += 2 * seq_len * hidden_size * intermediate_size
+    flops += 2 * seq_len * hidden_size * intermediate_size
+    flops += 2 * seq_len * intermediate_size * hidden_size
+
+    flops_layer_TF = flops / 1e12
+
+    bytes_per_element = 2
+    peak_memory = (
+        layer_params * bytes_per_element
+        + seq_len * hidden_size * bytes_per_element
+        + seq_len * num_heads * head_dim * bytes_per_element
+        + 2 * seq_len * num_kv_heads * head_dim * bytes_per_element
+        + num_heads * seq_len * seq_len * bytes_per_element
+    )
+    peak_memory_GB = peak_memory / (1024 ** 3)
+
+    return total_params, flops_layer_TF, peak_memory_GB
+
+
+def model_training_cost_analysis_deepseek(model_config_path):
+    """Analyze training cost of a DeepSeek-V3-style MoE model.
+
+    Same return signature as the Llama version. See the Part 2.3 writeup
+    for the MLA attention and the dense-vs-MoE layer breakdown.
+    """
+    with open(model_config_path) as f:
+        cfg = json.load(f)
+
+    hidden_size = cfg["hidden_size"]
+    num_layers = cfg["num_hidden_layers"]
+    num_heads = cfg["num_attention_heads"]
+    vocab_size = cfg["vocab_size"]
+    seq_len = cfg["max_position_embeddings"]
+    tie_embeddings = cfg.get("tie_word_embeddings", False)
+
+    q_lora_rank = cfg["q_lora_rank"]
+    kv_lora_rank = cfg["kv_lora_rank"]
+    qk_nope_dim = cfg["qk_nope_head_dim"]
+    qk_rope_dim = cfg["qk_rope_head_dim"]
+    v_head_dim = cfg["v_head_dim"]
+
+    num_dense_layers = cfg["first_k_dense_replace"]
+    dense_intermediate_size = cfg["intermediate_size"]
+    num_routed_experts = cfg["n_routed_experts"]
+    num_shared_experts = cfg["n_shared_experts"]
+    num_active_experts = cfg["num_experts_per_tok"]
+    moe_intermediate_size = cfg["moe_intermediate_size"]
+
+    attention_params = (
+        hidden_size * q_lora_rank
+        + q_lora_rank * num_heads * (qk_nope_dim + qk_rope_dim)
+        + hidden_size * (kv_lora_rank + qk_rope_dim)
+        + kv_lora_rank * num_heads * (qk_nope_dim + v_head_dim)
+        + num_heads * v_head_dim * hidden_size
+        + 2 * hidden_size
+    )
+
+    dense_mlp_params = 3 * hidden_size * dense_intermediate_size
+    routed_expert_params = num_routed_experts * 3 * hidden_size * moe_intermediate_size
+    shared_expert_params = num_shared_experts * 3 * hidden_size * moe_intermediate_size
+    moe_mlp_params = routed_expert_params + shared_expert_params
+
+    embedding_params = vocab_size * hidden_size
+    lm_head_params = 0 if tie_embeddings else vocab_size * hidden_size
+    final_norm_params = hidden_size
+
+    total_params = (
+        embedding_params
+        + lm_head_params
+        + final_norm_params
+        + num_dense_layers * (attention_params + dense_mlp_params)
+        + (num_layers - num_dense_layers) * (attention_params + moe_mlp_params)
+    )
+
+    effective_qk_dim = qk_nope_dim + qk_rope_dim
+
+    flops = 0
+    flops += 2 * seq_len * hidden_size * q_lora_rank
+    flops += 2 * seq_len * q_lora_rank * num_heads * effective_qk_dim
+    flops += 2 * seq_len * hidden_size * (kv_lora_rank + qk_rope_dim)
+    flops += 2 * seq_len * kv_lora_rank * num_heads * (qk_nope_dim + v_head_dim)
+    flops += 2 * seq_len * num_heads * v_head_dim * hidden_size
+    flops += 2 * num_heads * seq_len * seq_len * effective_qk_dim
+    flops += 2 * num_heads * seq_len * seq_len * v_head_dim
+    flops += 2 * seq_len * hidden_size * moe_intermediate_size * 3 * (
+        num_active_experts + num_shared_experts
+    )
+
+    flops_layer_TF = flops / 1e12
+
+    bytes_per_element = 2
+    moe_layer_params = attention_params + moe_mlp_params
+    peak_memory = (
+        moe_layer_params * bytes_per_element
+        + seq_len * hidden_size * bytes_per_element
+        + seq_len * num_heads * effective_qk_dim * bytes_per_element
+        + 2 * seq_len * kv_lora_rank * bytes_per_element
+        + num_heads * seq_len * seq_len * bytes_per_element
+    )
+    peak_memory_GB = peak_memory / (1024 ** 3)
 
     return total_params, flops_layer_TF, peak_memory_GB
 
 
 def get_optimal_N_D_from_cost(cost_budget):
-    """Returns (N, D, training_budget_flops, best_gpu) for a dollar training budget.
+    """Pick the GPU and (N, D) that minimize loss under a $ training budget.
 
-    Uses Chinchilla-style scaling law: L = 406.4/N^0.34 + 410.7/D^0.29 + 1.69
-    MFU = 40%.
+    cost_budget: a monetary training budget (in dollars)
+    Returns:
+        N: optimal model parameter count (absolute number)
+        D: optimal training token count (absolute number)
+        training_budget_flops: effective total training FLOPs
+        best_gpu: name of the selected GPU, one of {'H100', 'H200', 'B200'}
+
+    See the Part 2.2 writeup for the scaling law, the GPU price / TFLOPs
+    table, and the MFU assumption.
     """
     gpus = {
-        "H100": {"price_per_hour": 3.0,  "peak_tflops": 989.0},
-        "H200": {"price_per_hour": 4.0,  "peak_tflops": 989.0},
-        "B200": {"price_per_hour": 6.0,  "peak_tflops": 2250.0},
+        "H100": {"price_per_hour": 3.0, "peak_tflops": 989.0},
+        "H200": {"price_per_hour": 4.0, "peak_tflops": 989.0},
+        "B200": {"price_per_hour": 6.0, "peak_tflops": 2250.0},
     }
-    MFU = 0.40
 
-    # Pick GPU that gives the most FLOPs per dollar.
-    best_gpu, best_flops = None, 0.0
-    for name, spec in gpus.items():
-        flops = (cost_budget / spec["price_per_hour"]) * 3600 * spec["peak_tflops"] * 1e12 * MFU
-        if flops > best_flops:
-            best_flops, best_gpu = flops, name
+    mfu = 0.40
+    best_gpu = None
+    training_budget_flops = 0.0
 
-    F = best_flops
-    # Lagrangian optimum of L under 6*N*D = F:
-    #   N = [(a*alpha) / (b*beta) * (F/6)^beta] ^ (1/(alpha+beta))
-    a, alpha = 406.4, 0.34
-    b, beta  = 410.7, 0.29
-    N = int(round(((a * alpha) / (b * beta) * (F / 6) ** beta) ** (1 / (alpha + beta))))
-    D = int(round(F / (6 * N)))
+    for gpu_name, gpu_spec in gpus.items():
+        gpu_hours = cost_budget / gpu_spec["price_per_hour"]
+        available_flops = gpu_hours * 3600 * gpu_spec["peak_tflops"] * 1e12 * mfu
 
-    return N, D, F, best_gpu
+        if available_flops > training_budget_flops:
+            training_budget_flops = available_flops
+            best_gpu = gpu_name
 
+    a = 406.4
+    alpha = 0.34
+    b = 410.7
+    beta = 0.29
 
-def model_training_cost_analysis_deepseek(model_config_path):
-    """Returns (total_params, flops_layer_TF, peak_memory_GB) for DeepSeek-V3."""
-    with open(model_config_path) as f:
-        cfg = json.load(f)
+    N = int(round(((a * alpha) / (b * beta) * (training_budget_flops / 6) ** beta) ** (1 / (alpha + beta))))
+    D = int(round(training_budget_flops / (6 * N)))
 
-    h           = cfg["hidden_size"]
-    L           = cfg["num_hidden_layers"]
-    n_q         = cfg["num_attention_heads"]
-    V           = cfg["vocab_size"]
-    S           = cfg["max_position_embeddings"]
-    tie         = cfg.get("tie_word_embeddings", False)
-    q_lora      = cfg["q_lora_rank"]
-    kv_lora     = cfg["kv_lora_rank"]
-    qk_nope     = cfg["qk_nope_head_dim"]
-    qk_rope     = cfg["qk_rope_head_dim"]
-    v_head      = cfg["v_head_dim"]
-    k_dense     = cfg["first_k_dense_replace"]
-    dense_i     = cfg["intermediate_size"]
-    n_routed    = cfg["n_routed_experts"]
-    n_shared    = cfg["n_shared_experts"]
-    n_active    = cfg["num_experts_per_tok"]
-    moe_i       = cfg["moe_intermediate_size"]
-    n_kv        = n_q  # MLA uses full head count for kv
-
-    # ── MLA attention params ─────────────────────────────────────────────────
-    attn = (h * q_lora + q_lora * n_q * (qk_nope + qk_rope)          # Q down+up
-          + h * (kv_lora + qk_rope) + kv_lora * n_kv * (qk_nope + v_head)  # KV down+up
-          + n_q * v_head * h                                            # O proj
-          + h + h)                                                      # 2x RMSNorm
-
-    # ── MLP params ───────────────────────────────────────────────────────────
-    dense_mlp  = 3 * h * dense_i
-    moe_routed = n_routed * 3 * h * moe_i
-    moe_shared = n_shared * 3 * h * moe_i
-    moe_mlp    = moe_routed + moe_shared
-
-    # ── Total params ─────────────────────────────────────────────────────────
-    total_params = (V * h + (0 if tie else V * h) + h
-                  + k_dense * (attn + dense_mlp)
-                  + (L - k_dense) * (attn + moe_mlp))
-
-    activated = (k_dense * (attn + dense_mlp)
-               + (L - k_dense) * (attn + n_active * 3 * h * moe_i + moe_shared))
-
-    print(f"[DeepSeek-V3] Total params:     {total_params:,}  (~{total_params/1e9:.1f}B)")
-    print(f"[DeepSeek-V3] Activated/token:  {activated:,}  (~{activated/1e9:.1f}B)")
-
-    # ── FLOPs for one MoE layer (batch=1, seq=S) ─────────────────────────────
-    d_eff = qk_nope + qk_rope
-    f  = (2 * S * h * q_lora + 2 * S * q_lora * n_q * (qk_nope + qk_rope))  # Q
-    f += (2 * S * h * (kv_lora + qk_rope) + 2 * S * kv_lora * n_kv * (qk_nope + v_head))  # KV
-    f += 2 * S * n_q * v_head * h                                              # O
-    f += 2 * n_q * S * S * d_eff                                               # QK^T
-    f += 2 * n_q * S * S * v_head                                              # Attn@V
-    f += 2 * S * h * moe_i * (n_active + n_shared) * 3                        # MoE MLP
-    flops_layer_TF = f / 1e12
-
-    # ── Peak memory for one MoE layer (bf16) ─────────────────────────────────
-    BPE = 2
-    moe_layer_params = attn + moe_mlp
-    peak = (moe_layer_params * BPE
-          + S * h * BPE
-          + S * n_q * (qk_nope + qk_rope) * BPE
-          + 2 * S * kv_lora * BPE
-          + n_q * S * S * BPE)
-    peak_memory_GB = peak / (1024 ** 3)
-
-    return total_params, flops_layer_TF, peak_memory_GB
+    return N, D, training_budget_flops, best_gpu
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_config", type=str, default=None)
-    parser.add_argument("--training_budget", type=float, default=None)
+    parser = argparse.ArgumentParser(description="Model training cost analysis")
+    parser.add_argument("--model_config", type=str, help="Path to model config")
+    parser.add_argument(
+        "--training_budget",
+        type=float,
+        default=None,
+        help="Training budget in dollars",
+    )
     args = parser.parse_args()
 
     if args.model_config:
-        if "deepseek" in args.model_config.lower():
-            params, flops, mem = model_training_cost_analysis_deepseek(args.model_config)
+        if "deepseek" in args.model_config:
+            num_parameters, num_flops, memory_cost = model_training_cost_analysis_deepseek(
+                args.model_config
+            )
+        elif "llama" in args.model_config:
+            num_parameters, num_flops, memory_cost = model_training_cost_analysis_llama(
+                args.model_config
+            )
         else:
-            params, flops, mem = model_training_cost_analysis_llama(args.model_config)
-        print(f"Number of parameters: {params}")
-        print(f"Number of TFLOPs: {flops}")
-        print(f"Peak memory cost: {mem} GBs")
+            print("Unknown model type — name your config llama*.json or deepseek*.json")
+            raise SystemExit(1)
+
+        print(f"Number of parameters: {num_parameters}")
+        print(f"Number of TFLOPs: {num_flops}")
+        print(f"Peak memory cost: {memory_cost} GBs")
 
     if args.training_budget:
-        N, D, F, gpu = get_optimal_N_D_from_cost(args.training_budget)
-        print(f"best_gpu: {gpu}")
-        print(f"training_budget_flops: {F:.2e}")
+        N, D, training_budget_flops, best_gpu = get_optimal_N_D_from_cost(
+            args.training_budget
+        )
+        print(f"best_gpu: {best_gpu}")
+        print(f"training_budget_flops: {training_budget_flops}")
         print(f"Optimal N: {N}")
         print(f"Optimal D: {D}")
